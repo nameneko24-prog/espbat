@@ -1,0 +1,319 @@
+/*
+  ESP32 Advanced Monitor - V26.3 (Unit-01: CAPTIVE PORTAL SPEC)
+  ------------------------------------------------------------------------------------------------------
+  修正点:
+    - 自作サーバーに DNSサーバーを統合し、WiFi接続時の「自動画面表示（キャプティブポータル）」を復活。
+    - 入力Aは D18 を継続。Bluetooth排除、自作設定画面を維持。
+    - 明朝体、漢字表記、ミリ秒タイマーを完璧に維持。
+*/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DNSServer.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+#include <LiquidCrystal_I2C.h>
+#include <Preferences.h>
+#include <Wire.h>
+#include <time.h>
+#include <esp_task_wdt.h>
+
+// 定数
+const uint32_t WDT_VAL = 120000;
+const int PIN_BAT = 34;
+const int PIN_RLY = 26;
+const int PIN_INA = 18;
+const int PIN_INB = 4;
+const byte DNS_PORT = 53;
+
+// オブジェクト
+WiFiUDP ntp_u;
+NTPClient ntp_c(ntp_u, "pool.ntp.org", 9 * 3600, 60000);
+LiquidCrystal_I2C lcd_m(0x27, 16, 2); 
+Preferences pref_m;
+WebServer server_m(80);
+DNSServer dns_m;
+
+// 設定
+float v_cut = 10.0f;
+float v_rec = 11.0f;
+unsigned long h_timer = 1;
+const float div_ratio = 22.0f / (100.0f + 22.0f);
+
+// 状態
+bool st_ina = false;
+bool st_rly = true;
+bool st_low = false;
+bool st_stp = false;
+bool st_psv = true;
+bool st_rtc = false;
+bool st_srv = false;
+unsigned long ms_ina_on = 0;
+unsigned long ms_ina_off = 0;
+unsigned long ms_last_s = 0;
+unsigned long ms_lowv = 0;
+float v_curr = 0.0f;
+String lines_lcd[2] = {"", ""};
+
+// エヴァ風共通CSS
+const char* CSS_EVANGELION = 
+"@import url('https://fonts.googleapis.com/css2?family=Noto+Serif+JP:wght@900&family=Share+Tech+Mono&display=swap');"
+"body{background-color:#000;color:#ff9900;font-family:'Noto Serif JP', serif;margin:0;padding:0;overflow-x:hidden;}"
+".screen{width:100vw;min-height:100vh;display:flex;flex-direction:column;border:8px solid #ff9900;box-sizing:border-box;position:relative;}"
+".header{background:#ff9900;color:#000;padding:5px 15px;font-weight:bold;display:flex;justify-content:space-between;font-size:16px;font-family:'Share Tech Mono', monospace;}"
+".rainbow-bar{height:15px;width:100%;background:linear-gradient(90deg, #ff0000, #ffff00, #00ff00, #00ffff, #0000ff, #ff00ff, #ff0000);}"
+".btn{background:transparent;border:3px solid #ff9900;color:#ff9900;padding:18px;font-family:'Noto Serif JP', serif;font-weight:bold;cursor:pointer;text-transform:uppercase;font-size:18px;transition:0.2s;text-decoration:none;text-align:center;display:block;}"
+".btn:active{background:#ff9900;color:#000;}"
+".btn-danger{border-color:#ff3300;color:#ff3300;}"
+".btn-danger:active{background:#ff3300;color:#fff;}";
+
+// ダッシュボードHTML
+const char* HTML_DASHBOARD = 
+"<!DOCTYPE html><html lang='ja'><head>"
+"<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>MAGI SYSTEM: V26.3</title>"
+"<style>"
+"CSS_PLACEHOLDER"
+".main-timer-container{flex:1;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:10px;position:relative;}"
+".timer-label{position:absolute;top:20px;left:30px;text-align:left;}"
+".timer-label .jp{font-size:32px;font-weight:bold;letter-spacing:6px;}"
+".timer-label .en{font-size:16px;font-family:'Share Tech Mono', monospace;opacity:0.8;}"
+".timer-display{font-size:22vw;font-family:'Share Tech Mono', monospace;font-weight:bold;line-height:1;color:#ff9900;text-shadow:0 0 40px rgba(255,153,0,0.7);margin-top:30px;}"
+".ms-display{font-size:10vw;margin-left:15px;}"
+".power-status{position:absolute;top:20px;right:30px;display:flex;flex-direction:column;gap:20px;}"
+".status-box{border:3px solid #ff9900;padding:10px 25px;text-align:center;width:140px;transition:0.3s;}"
+".status-box.active{background:#ff9900;color:#000;box-shadow:0 0 20px #ff9900;}"
+".status-box .jp{font-size:26px;font-weight:bold;}"
+".status-box .en{font-size:12px;font-family:'Share Tech Mono', monospace;}"
+".bottom-info{border-top:4px solid #ff9900;padding:20px;display:grid;grid-template-columns:1fr 1fr;gap:20px;background:rgba(255,153,0,0.08);}"
+".info-item{border:2px solid #ff9900;padding:15px;background:rgba(255,153,0,0.15);}"
+".info-label{font-size:14px;opacity:0.7;margin-bottom:8px;}"
+".info-val{font-size:32px;font-weight:bold;text-align:right;font-family:'Share Tech Mono', monospace;}"
+".operation-time{grid-column:span 2;text-align:center;font-size:26px;border:3px solid #ff9900;padding:12px;margin-bottom:10px;background:rgba(255,153,0,0.1);}"
+".btn-area{padding:20px;display:grid;grid-template-columns:1fr 1fr;gap:20px;}"
+".warning-text{color:#ff3300;animation:blink 0.4s infinite;}"
+"@keyframes blink{0%{opacity:1;}50%{opacity:0.2;}100%{opacity:1;}}"
+"</style></head><body>"
+"<div class='screen'>"
+"<div class='header'><span>MAGI_01: MELCHIOR</span><span>SYSTEM_V26.3: NOMINAL</span></div>"
+"<div class='rainbow-bar'></div>"
+"<div class='main-timer-container'>"
+"<div class='timer-label'>"
+"<div class='jp'>活動限界まで <span style='font-size:18px'>あと</span></div>"
+"<div class='en'>ACTIVE TIME REMAINING</div>"
+"</div>"
+"<div class='timer-display'><span id='hms'>00:00:00</span><span class='ms-display' id='ms'>00</span></div>"
+"<div class='power-status'>"
+"<div id='box-ext' class='status-box'><div class='jp'>外部</div><div class='en'>EXTERNAL</div></div>"
+"<div id='box-int' class='status-box'><div class='jp'>内部</div><div class='en'>INTERNAL</div></div>"
+"</div>"
+"</div>"
+"<div class='bottom-info'>"
+"<div class='operation-time' id='datetime'>作戦時刻: --/--/-- (---) --:--:--</div>"
+"<div class='info-item'><div class='info-label'>電圧 (VOLTAGE)</div><div class='info-val' id='v'>--.- V</div></div>"
+"<div class='info-item'><div class='info-label'>出力状態 (STATUS)</div><div class='info-val' id='rs' style='font-family:\"Noto Serif JP\", serif;'>---</div></div>"
+"</div>"
+"<div class='btn-area'>"
+"<button id='stopBtn' class='btn btn-danger' onclick='toggleStop()'>強制停止</button>"
+"<button class='btn' onclick='syncTime()'>時刻同期</button>"
+"<a href='/settings' class='btn' style='grid-column:span 2'>システム設定変更</a>"
+"</div>"
+"</div>"
+"<script>"
+"const days=['SUN','MON','TUE','WED','THU','FRI','SAT'];"
+"let remSec = 0; let isA = false; let lastUpdate = Date.now();"
+"function toggleStop(){if(confirm('リレーを強制停止しますか？'))fetch('/toggle_stop').then(r=>update());}"
+"function syncTime(){var t=Math.floor(Date.now()/1000);fetch('/synctime?t='+t).then(r=>{if(r.ok)alert('時刻同期完了');});}"
+"function update(){fetch('/api').then(r=>r.json()).then(d=>{"
+"document.getElementById('v').innerText=d.v.toFixed(2)+' V';"
+"const rs=document.getElementById('rs');"
+"if(d.ms){rs.innerText='強制停止中';rs.className='info-val warning-text';document.getElementById('stopBtn').innerText='解除';}"
+"else if(d.r){rs.innerText='出力中';rs.className='info-val';document.getElementById('stopBtn').innerText='強制停止';}"
+"else{rs.innerText='活動終了';rs.className='info-val warning-text';}"
+"remSec = d.rem_s; isA = d.a; lastUpdate = Date.now();"
+"document.getElementById('box-ext').className='status-box '+(d.a?'active':'');"
+"document.getElementById('box-int').className='status-box '+(d.a?'':'active');"
+"const dt=new Date(d.t*1000);const dts=dt.getFullYear()+'/'+(dt.getMonth()+1).toString().padStart(2,'0')+'/'+dt.getDate().toString().padStart(2,'0')+' ('+days[dt.getDay()]+') '+dt.getHours().toString().padStart(2,'0')+':'+dt.getMinutes().toString().padStart(2,'0')+':'+dt.getSeconds().toString().padStart(2,'0');"
+"document.getElementById('datetime').innerText='作戦時刻: '+dts;"
+"}).catch(e=>console.error('MAGI ERROR:',e));}"
+"function runTimer(){"
+"  let now = Date.now(); let elapsed = (now - lastUpdate) / 1000;"
+"  let currentRem = isA ? 0 : Math.max(0, remSec - elapsed);"
+"  if(isA){ document.getElementById('hms').innerText='∞'; document.getElementById('ms').innerText='--'; return; }"
+"  let h = Math.floor(currentRem / 3600); let m = Math.floor((currentRem % 3600) / 60); let s = Math.floor(currentRem % 60);"
+"  let ms = Math.floor((currentRem % 1) * 100);"
+"  document.getElementById('hms').innerText = String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');"
+"  document.getElementById('ms').innerText = String(ms).padStart(2,'0');"
+"}"
+"setInterval(update,1000); setInterval(runTimer, 10); update();"
+"</script></body></html>";
+
+// 設定画面HTML
+const char* HTML_SETTINGS = 
+"<!DOCTYPE html><html lang='ja'><head>"
+"<meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+"<title>MAGI SYSTEM: SETTINGS</title>"
+"<style>"
+"CSS_PLACEHOLDER"
+".settings-form{padding:30px;flex:1;display:flex;flex-direction:column;gap:30px;}"
+".input-group{display:flex;flex-direction:column;gap:10px;}"
+"label{font-size:24px;font-weight:bold;}"
+"input{background:#111;border:2px solid #ff9900;color:#ff9900;padding:15px;font-size:24px;font-family:'Share Tech Mono', monospace;}"
+"</style></head><body>"
+"<div class='screen'>"
+"<div class='header'><span>MAGI_01: MELCHIOR</span><span>SYSTEM_CONFIGURATION</span></div>"
+"<div class='rainbow-bar'></div>"
+"<form class='settings-form' action='/save' method='POST'>"
+"<div class='input-group'><label>停止電圧 (CUT-OFF VOLTAGE)</label><input type='number' step='0.1' name='cv' value='V_CUT_VAL'></div>"
+"<div class='input-group'><label>復帰電圧 (RECOVER VOLTAGE)</label><input type='number' step='0.1' name='rv' value='V_REC_VAL'></div>"
+"<div class='input-group'><label>オフタイマー時間 (TIMER HOURS)</label><input type='number' name='th' value='H_TIMER_VAL'></div>"
+"<button type='submit' class='btn'>設定を保存して再起動</button>"
+"<a href='/' class='btn' style='border-color:#888;color:#888;'>戻る</a>"
+"</form></div></body></html>";
+
+void handleRoot() {
+  String html = String(HTML_DASHBOARD);
+  html.replace("CSS_PLACEHOLDER", CSS_EVANGELION);
+  server_m.send(200, "text/html", html);
+}
+
+void handleSettings() {
+  String html = String(HTML_SETTINGS);
+  html.replace("CSS_PLACEHOLDER", CSS_EVANGELION);
+  html.replace("V_CUT_VAL", String(v_cut, 1));
+  html.replace("V_REC_VAL", String(v_rec, 1));
+  html.replace("H_TIMER_VAL", String(h_timer));
+  server_m.send(200, "text/html", html);
+}
+
+void handleSave() {
+  if (server_m.hasArg("cv")) v_cut = server_m.arg("cv").toFloat();
+  if (server_m.hasArg("rv")) v_rec = server_m.arg("rv").toFloat();
+  if (server_m.hasArg("th")) h_timer = server_m.arg("th").toInt();
+  pref_m.begin("magi-cfg", false);
+  pref_m.putFloat("cv", v_cut); pref_m.putFloat("rv", v_rec); pref_m.putULong("th", h_timer);
+  pref_m.end();
+  server_m.send(200, "text/html", "<html><body style='background:#000;color:#ff9900;text-align:center;padding-top:50px;'><h1>SAVED. REBOOTING...</h1></body></html>");
+  delay(1000); ESP.restart();
+}
+
+void handleApi() {
+  unsigned long n = millis(); long r = 0;
+  if (!st_ina && ms_ina_off != 0) { r = (long)h_timer * 3600 - (n - ms_ina_off) / 1000; if (r < 0) r = 0; }
+  time_t t; time(&t);
+  String j = "{\"v\":" + String(v_curr) + ",\"r\":" + (st_rly?"true":"false") + ",\"a\":" + (st_ina?"true":"false") + 
+             ",\"ms\":" + (st_stp?"true":"false") + ",\"rem_s\":" + String(r) + ",\"t\":" + String(t) + "}";
+  server_m.send(200, "application/json", j);
+}
+
+void handleSync() {
+  if (server_m.hasArg("t")) {
+    time_t t = server_m.arg("t").toInt(); struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+    settimeofday(&tv, NULL); st_rtc = true; server_m.send(200, "text/plain", "OK");
+  }
+}
+
+void handleStop() { st_stp = !st_stp; server_m.send(200, "text/plain", "OK"); }
+
+void handleNotFound() {
+  server_m.sendHeader("Location", "/", true);
+  server_m.send(302, "text/plain", "");
+}
+
+void printLcd(int row, String text) {
+  if (lines_lcd[row] == text) return;
+  lines_lcd[row] = text; lcd_m.setCursor(0, row);
+  String l = text; while (l.length() < 16) l += " "; lcd_m.print(l);
+}
+
+void enableWifi() {
+  if (!st_psv) return;
+  esp_task_wdt_reset();
+  WiFi.mode(WIFI_AP);
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  WiFi.softAP("ESP32_Monitor_AP", "password");
+  delay(500);
+  dns_m.start(DNS_PORT, "*", IPAddress(192, 168, 4, 1));
+  if (!st_srv) {
+    server_m.on("/", handleRoot);
+    server_m.on("/generate_204", handleRoot);  // Android Captive Portal
+    server_m.on("/library/test/success.html", handleRoot); // iOS Captive Portal
+    server_m.on("/settings", handleSettings);
+    server_m.on("/save", HTTP_POST, handleSave);
+    server_m.on("/api", handleApi);
+    server_m.on("/synctime", handleSync); 
+    server_m.on("/toggle_stop", handleStop);
+    server_m.onNotFound(handleNotFound);
+    server_m.begin();
+    st_srv = true;
+  }
+  ntp_c.begin(); lcd_m.backlight();
+  st_psv = false;
+}
+
+void disableWifi() {
+  if (st_psv) return;
+  ntp_c.end(); dns_m.stop();
+  if (st_srv) { server_m.stop(); st_srv = false; }
+  WiFi.softAPdisconnect(true); WiFi.mode(WIFI_OFF);
+  lcd_m.noBacklight();
+  st_psv = true;
+}
+
+void updateLcd(float v) {
+  if (st_psv) return;
+  struct tm ti;
+  if (getLocalTime(&ti)) {
+    char ts[17]; strftime(ts, sizeof(ts), "%H:%M:%S", &ti);
+    String st = st_rly ? "ON " : (st_stp ? "STP" : "OFF");
+    printLcd(0, String(ts) + " OUT:" + st);
+  } else { printLcd(0, "WiFi: OK"); }
+  char b[17];
+  if (st_ina) { snprintf(b, sizeof(b), "%2.1fV EXT:ON INF", v); }
+  else {
+    long r = 0; if (ms_ina_off != 0) { r = (long)h_timer * 3600 - (millis() - ms_ina_off) / 1000; if (r < 0) r = 0; }
+    snprintf(b, sizeof(b), "%2.1fV INT:ON %dm", v, (int)(r/60));
+  }
+  printLcd(1, String(b));
+}
+
+void setup() {
+  setCpuFrequencyMhz(240); Serial.begin(115200); delay(1000);
+  esp_task_wdt_config_t wdt_c = { .timeout_ms = WDT_VAL, .idle_core_mask = 0, .trigger_panic = true };
+  esp_task_wdt_reconfigure(&wdt_c); esp_task_wdt_add(NULL);
+  Wire.begin(16, 17, 400000); lcd_m.init();
+  pinMode(PIN_RLY, OUTPUT); pinMode(PIN_INA, INPUT_PULLUP); pinMode(PIN_INB, INPUT_PULLUP);
+  pref_m.begin("magi-cfg", false);
+  v_cut = pref_m.getFloat("cv", 10.0f); v_rec = pref_m.getFloat("rv", 11.0f); h_timer = pref_m.getULong("th", 1);
+  pref_m.end();
+  st_ina = (digitalRead(PIN_INA) == HIGH);
+  if (st_ina) { enableWifi(); ms_ina_on = millis(); } else { disableWifi(); }
+  esp_task_wdt_reset();
+}
+
+void loop() {
+  esp_task_wdt_reset();
+  if (!st_psv && st_srv) {
+    dns_m.processNextRequest();
+    server_m.handleClient();
+    yield();
+  }
+  unsigned long n = millis();
+  bool pa = st_ina; st_ina = (digitalRead(PIN_INA) == HIGH);
+  if (st_ina && !pa) { ms_ina_on = n; enableWifi(); }
+  if (!st_ina && !st_psv && (ms_ina_off == 0 || (n - ms_ina_off) >= (h_timer * 3600000UL))) { disableWifi(); }
+  
+  if (n - ms_last_s >= 1000) {
+    ms_last_s = n;
+    float raw = 0; for(int i=0; i<10; i++) raw += analogRead(PIN_BAT); raw /= 10.0;
+    v_curr = (raw * 3.3f / 4095.0f) / div_ratio;
+    if (v_curr < v_cut) { if (ms_lowv == 0) ms_lowv = n; if (n - ms_lowv >= 3000) st_low = true; }
+    else { ms_lowv = 0; if (v_curr >= v_rec) st_low = false; }
+    if (st_ina) ms_ina_off = 0; else if (ms_ina_off == 0) ms_ina_off = n;
+    bool exp = (ms_ina_off != 0 && (n - ms_ina_off) >= (h_timer * 3600000UL));
+    st_rly = !st_low && (st_ina || !exp) && !st_stp;
+    digitalWrite(PIN_RLY, st_rly ? HIGH : LOW);
+    updateLcd(v_curr);
+  }
+}
